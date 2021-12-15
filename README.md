@@ -11,7 +11,41 @@ I wrote this document over a year ago, so some things may have changed with time
 
 TimescaleDB is an extension for PostgreSQL database.  Follow the installation guide bellow for getting the extension installed on your computer.
 
-1. [Installation Guide and Download](https://docs.timescale.com/latest/getting-started/)
+[Installation Guide and Download](https://docs.timescale.com/latest/getting-started/)
+
+1. Download TimescaleDB installer zip file and extract the `timescaledb` folder to the desktop.
+
+2. Add Postgres file path to system environment variables.
+
+   1. Search Environment Variables and click `Edit the system environment variables`
+
+   2. When the system properties windows comes up, make sure it's on the `Advanced` tab  and click the `Environment Variables` button.
+
+   3. Click on the `Path` variable in the System variables table and click the `Edit...` button.
+
+   4. Double-click the next empty row in the table and paste in the path to the bin folder in the PostgreSQL installation folder.
+
+      Example path:
+
+      > C:\Program Files\PostgreSQL\11\bin
+
+   5. Click `OK`.
+
+3. Stop the PostgreSQL service.
+
+4. Right click on `setup.exe` within the extracted timescaledb folder and click **Run as administrator**. A command prompt will appear.
+
+5. Press `y` to tune the PostgresDB installation
+
+6. When prompted, paste in the path to the data folder in the PostgreSQL installation folder and hit `enter`
+
+   Example path:
+
+   > C:\Program Files\PostgreSQL\11\data
+
+7. Continue to type `y` and then `enter` until no longer prompted to do so. 
+
+   * If the installation is not successful due to an "access denied" error, make sure you ran the setup.exe as administrator.
 
 ## Setup TimescaleDB for Ignition
 
@@ -31,7 +65,7 @@ CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 SELECT
 	* 
 FROM 
-	create_hypertable('sqlth_1_data','t_stamp', if_not_exists => True, 			chunk_time_interval => 86400000, migrate_data => True);
+	create_hypertable('sqlth_1_data','t_stamp', if_not_exists => True, chunk_time_interval => 86400000, migrate_data => True);
 ```
 
 ### Setup the hypertable 
