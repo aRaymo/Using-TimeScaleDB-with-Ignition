@@ -178,7 +178,7 @@ Do the conversion below as early as you can, ideally while the table is still cl
 ```sql
 SELECT create_hypertable(
     'sqlth_1_data',
-    by_range('t_stamp', 86400000),  -- 1 day chunks
+    by_range('t_stamp', 86400000),  -- chunk interval in ms: 1 day (see "Choosing the chunk interval")
     if_not_exists => TRUE,
     migrate_data => TRUE
 );
@@ -186,7 +186,8 @@ SELECT create_hypertable(
 
 * TimescaleDB prints warnings that `character varying` and `timestamp without time zone` columns "do not follow best practices". These warnings are expected and harmless. Don't change Ignition's column types.
 * If the table already holds a lot of data, `migrate_data` copies it into chunks and locks the table until the copy finishes. Ignition's store-and-forward buffers history while the table is locked, but run the conversion during a quiet period.
-* A one-day chunk works well for most systems. A good target is for the most recent chunk and its indexes to fit comfortably in memory. To change the interval for future chunks later, use a command like `SELECT set_chunk_time_interval('sqlth_1_data', BIGINT '43200000');` (12 hours).
+* **The chunk interval.** `86400000` (1 day) suits most Ignition systems: up to about 20 million stored values a day, kept for up to about a year. If you store more than that, or keep raw history for years, read [Choosing the chunk interval](#choosing-the-chunk-interval) before you run this. You can change the interval later, but only new chunks use the new value.
+* **Always pass an interval.** If you leave it out, TimescaleDB doesn't raise an error on Ignition's `BIGINT` column. It silently uses 1,000,000 ms (about 17-minute chunks), which is about 2,600 chunks for 30 days of history. `INTERVAL '1 day'` is rejected, so give the value in milliseconds.
 
 ### Set the integer "now" function
 
@@ -213,7 +214,7 @@ ALTER TABLE sqlth_1_data SET (
 Add a policy that converts chunks to the columnstore once they're older than 7 days:
 
 ```sql
-CALL add_columnstore_policy('sqlth_1_data', after => BIGINT '604800000');  -- 7 days
+CALL add_columnstore_policy('sqlth_1_data', after => BIGINT '604800000');  -- 7 days; keep this >= the chunk interval
 ```
 
 * `add_columnstore_policy` is a procedure, so it's run with `CALL`, not `SELECT`.
@@ -227,7 +228,7 @@ CALL add_columnstore_policy('sqlth_1_data', after => BIGINT '604800000');  -- 7 
 Retention policies are free in the Community edition. The Enterprise edition is no longer required.
 
 ```sql
-SELECT add_retention_policy('sqlth_1_data', drop_after => BIGINT '2592000000');  -- 30 days
+SELECT add_retention_policy('sqlth_1_data', drop_after => BIGINT '2592000000');  -- 30 days; whole chunks are dropped, so expect 30-31 days with 1-day chunks
 ```
 
 Make `drop_after` longer than the columnstore `after` value. Some handy values in milliseconds:
@@ -280,6 +281,126 @@ SELECT pg_size_pretty(before_compression_total_bytes) AS before,
        pg_size_pretty(after_compression_total_bytes)  AS after
 FROM hypertable_columnstore_stats('sqlth_1_data');
 ```
+
+## Choosing the chunk interval
+
+The chunk interval is how much time each chunk covers. It's the `86400000` (1 day) in `by_range('t_stamp', 86400000)`. One day is a good default for most Ignition systems. The right value depends on two things: how many values Ignition stores per day, and how long you keep raw history.
+
+### Quick guide
+
+| Your system | Stored values per day | Raw history kept | Chunk interval | Value in ms |
+| --- | --- | --- | --- | --- |
+| Most systems | Up to ~20 million (~230/s) | Up to ~1 year | 1 day | `86400000` |
+| Low rate, long history | Up to ~3 million (~35/s) | Years (up to ~10) | 7 days | `604800000` |
+| Busy | ~20–100 million (~230–1,150/s) | Up to a few months | 6–12 hours | `21600000` to `43200000` |
+| Very busy | Over ~100 million (1,150/s and up) | Weeks | 1–3 hours | `3600000` to `10800000` |
+
+At the top of each row's rate range, PostgreSQL needs about 5–6 GB of RAM to follow the memory rule below. If you need years of raw history at a high rate, the rows above conflict. In that case, keep raw data for less time and use [continuous aggregates](#optional-continuous-aggregates-for-long-term-trends) for long-term trends, or give PostgreSQL more RAM and use a longer interval.
+
+Examples, using Ignition's default 10-second storage rate:
+
+* 1,000 tags with 10% changing per check is about 10 values/s, or 0.9 million a day. Use 1 day, or 7 days if you keep years of history.
+* 10,000 tags with 10% changing is about 100 values/s, or 8.6 million a day. Use 1 day.
+* 50,000 tags at a 1-second rate with 20% changing is about 10,000 values/s, or 860 million a day. Use 1 hour. That's about 36 million rows per chunk, so PostgreSQL needs about 9 GB of RAM.
+
+### What the interval trades off
+
+**Not too big: the newest chunk has to fit in memory.** Every insert updates the newest chunk's indexes. Tiger Data's [sizing rule](https://www.tigerdata.com/docs/learn/hypertables/sizing-hypertable-chunks) is that the indexes of the chunks being written should fit in 25% of main memory, which is what `timescaledb-tune` sets `shared_buffers` to. Uncompressed, one Ignition history row takes about 120 bytes, and roughly half of that is index. (Inductive Automation's own estimate is about 100 bytes.) So:
+
+* newest chunk ≈ values per day × chunk length in days × 120 bytes
+* its indexes ≈ half of that
+* longest interval in days ≈ 25% of PostgreSQL's RAM ÷ (values per day × 60 bytes)
+
+For example, 8.6 million values a day is about 1 GB per 1-day chunk, with about 0.5 GB of indexes. That fits easily on a server that gives PostgreSQL 4 GB or more. If Ignition and PostgreSQL share a machine, count only the memory PostgreSQL gets.
+
+**Not too small, part 1: keep the total number of chunks low.** The number of chunks is your retention divided by the interval. Ignition's seed-value query has no lower time bound (see [Known issues and tips](#known-issues-and-tips)). So PostgreSQL plans **every** chunk in the table each time a chart loads, even when the tag has fresh data. The new last-value optimization in TimescaleDB 2.30 doesn't apply to Ignition's query, because the query filters on `t_stamp`. Here are measured planning times for that query:
+
+| Chunks in the table | Example | Planning time per seed query (uncompressed / compressed) |
+| --- | --- | --- |
+| 31 | 1-day chunks, 30 days | ~1 ms / ~2 ms |
+| 366 | 1-day chunks, 1 year | ~14 ms / ~46 ms |
+| ~2,200 | 4-hour chunks, 1 year | ~0.5 s / ~2.6 s |
+| 8,760 | 1-hour chunks, 1 year | Fails with `out of shared memory` on PostgreSQL's default lock settings |
+
+These numbers come from a small test server running TimescaleDB 2.30.2 and PostgreSQL 16, with synthetic Ignition-style data. Your times will differ, but the trend holds.
+
+Each chunk also takes about 3 locks per query, or about 5 once it's compressed. Every pooled Ignition connection also caches metadata for every chunk: about 88 MB per connection at ~2,200 compressed chunks. Tiger Data calls more than 1,000 chunks in one hypertable an anti-pattern. Aim to stay under about 500: interval ≥ retention ÷ 500. For example, keep 1 day for up to a year of history, and use 7 days for multi-year history.
+
+`timescaledb-tune` raises `max_locks_per_transaction` from PostgreSQL's default of 64 to 256 on an 8 GB machine, 512 on 16 GB, and 1024 on 32 GB. That helps, but it doesn't fix the planning time. Check your value with `SHOW max_locks_per_transaction;`.
+
+**Not too small, part 2: slow-changing tags need enough rows per chunk to compress well.** The columnstore compresses each tag's rows within a chunk, in batches of up to 1,000 rows. A tag that stores only a few values per chunk ends up in tiny batches, which compress badly. In testing, compressed storage per value was:
+
+* about 40 bytes at 10 values per tag per chunk
+* about 9 bytes at 100
+* about 6 bytes at 500 or more
+
+For comparison, a value takes about 120 bytes uncompressed. A tag that logs once a minute took 2.7 times more compressed space with 1-hour chunks than with 1-day chunks. For the tags that make up most of your data, aim for at least 100 stored values per chunk, ideally 500 or more. In other words, the interval should be at least 100 times the typical time between stored values.
+
+**Policies act on whole chunks.** A chunk is compressed only when its newest data is older than the columnstore `after` value. It's dropped only when its newest data is older than `drop_after`. So:
+
+* With 1-day chunks, data is compressed when it's 7–8 days old and deleted when it's 30–31 days old.
+* With 7-day chunks, the same settings mean 7–14 days and 30–37 days.
+
+On Ignition's integer `t_stamp`, both jobs run once a day by default, which can add up to another day. Keep the chunk interval no longer than `after`, and small compared with your retention. Chunks are aligned to the Unix epoch, so 1-day chunks start at 00:00 UTC, not local midnight. 7-day chunks start on Thursdays at 00:00 UTC.
+
+### Measure your system
+
+Inductive Automation's estimate is **values per second ≈ tags × fraction changing per check ÷ storage rate in seconds**. Ignition stores a value only when it changes by more than the deadband, so the real rate is usually far below tags × scan rate. Max Time Between Samples sets a minimum rate.
+
+To see the actual rate, check the Gateway's Store & Forward page and multiply by 86,400 to get values per day. That rate can include other writes on the same database connection, such as transaction groups.
+
+* **8.3:** Platform > System > Store & Forward, under Store Rate and Forward Rate.
+* **8.1:** Status > Connections > Store & Forward, under Aggregate Throughput.
+
+If Ignition is still partitioning (before you switch), count the rows in one full monthly table and divide by the number of days in that month:
+
+```sql
+SELECT count(*) / 30 AS avg_rows_per_day FROM sqlt_data_1_2026_09;  -- September has 30 days
+```
+
+After the conversion, use these queries.
+
+Average values per day over the last week:
+
+```sql
+SELECT count(*) / 7 AS avg_rows_per_day
+FROM sqlth_1_data
+WHERE t_stamp >= unix_now() - BIGINT '604800000';
+```
+
+Current chunk interval in milliseconds:
+
+```sql
+SELECT integer_interval FROM timescaledb_information.dimensions WHERE hypertable_name = 'sqlth_1_data';
+```
+
+Size of the most recent chunks. Compare the newest full chunk's `index_size` with 25% of PostgreSQL's RAM:
+
+```sql
+SELECT c.chunk_name,
+       to_timestamp(c.range_start_integer / 1000.0) AS range_start,
+       to_timestamp(c.range_end_integer / 1000.0)   AS range_end,
+       c.is_compressed,
+       pg_size_pretty(s.total_bytes) AS total_size,
+       pg_size_pretty(s.index_bytes) AS index_size
+FROM timescaledb_information.chunks c
+JOIN chunks_detailed_size('sqlth_1_data') s
+  ON s.chunk_schema = c.chunk_schema AND s.chunk_name = c.chunk_name
+WHERE c.hypertable_name = 'sqlth_1_data'
+ORDER BY c.range_start_integer DESC
+LIMIT 10;
+```
+
+### Changing the interval later
+
+```sql
+SELECT set_chunk_time_interval('sqlth_1_data', BIGINT '604800000');  -- 7 days, for chunks created from now on
+```
+
+* Only new chunks use the new interval. Existing chunks keep their size, and the policies keep working across the mix.
+* The first new chunk may be shorter than the new interval, so that it lines up with the existing chunks.
+* If you already have far too many small chunks, either lengthen the interval and let retention age out the small ones, or combine adjacent chunks with [`merge_chunks`](https://www.tigerdata.com/docs/reference/timescaledb/hypertables/merge_chunks).
+* Don't use the `timescaledb.compress_chunk_time_interval` option, which merges chunks during compression, on this table. On Ignition's millisecond column, its value is read as a PostgreSQL interval in microseconds. So `'7 days'` merges everything into one ever-growing chunk, and retention silently stops deleting data. The option is also marked experimental, and its merges can't be undone.
 
 ## Optional: continuous aggregates for long-term trends
 
